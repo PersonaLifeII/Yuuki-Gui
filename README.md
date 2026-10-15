@@ -1,2 +1,2 @@
-# Yakino_hub
-Yakino hub
+# Yuuki GUI
+Yuuki GUI
