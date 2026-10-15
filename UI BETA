@@ -22,7 +22,8 @@
 	(dropdown also has :Refresh(list), button has :SetTitle only).
 
 	Section:addPlayers(title, callback, includeSelf?)           callback(Player or nil, obj)  -- hover = avatar preview
-	Section:addLabel(textOrFunction, interval?)                 -- function = updates in real time
+	Section:addLabel(textOrFunction, interval?, textSize?)      -- function = updates in real time
+	                                                            -- function may return (text, { [line] = Player }) -> hover line = avatar
 	Section:addWheel(title, options, callback)                  callback(result, index, obj)
 
 	UI:setSize(w, h) / UI:resetSize()                           -- window is also resizable by dragging its edges
@@ -2218,9 +2219,10 @@ end
 --   addLabel("static text")
 --   addLabel(function() return "FPS: " .. fps end, 0.1)   -- re-evaluated every `interval` seconds
 -- supports rich text, e.g. <b>bold</b>
-function Section:addLabel(content, interval)
+function Section:addLabel(content, interval, textSize)
 	local lib = self.page.library
 	interval = interval or 0.1
+	textSize = textSize or 13
 
 	local row = self:_row("Label", 32)
 	row.AutomaticSize = Enum.AutomaticSize.Y
@@ -2234,11 +2236,11 @@ function Section:addLabel(content, interval)
 
 	local text = lib:_new("TextLabel", {
 		Name = "Text",
-		Size = UDim2.new(1, 0, 0, 16),
+		Size = UDim2.new(1, 0, 0, textSize + 3),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
 		Text = "",
-		TextSize = 13,
+		TextSize = textSize,
 		TextWrapped = true,
 		RichText = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -2252,12 +2254,109 @@ function Section:addLabel(content, interval)
 	local elapsed = 0
 	local obj = { Instance = row }
 
+	-- hover zones: the updater may return a second value, a table { [lineNumber] = Player },
+	-- and hovering that line's text shows the player's avatar (like addPlayers)
+	local TextService = game:GetService("TextService")
+	local hits = {}
+	local layoutToken = 0
+
+	local function getHit(i)
+		if hits[i] then
+			return hits[i]
+		end
+		local btn = lib:_new("TextButton", {
+			Name = "Hover" .. i,
+			BackgroundTransparency = 1,
+			Text = "",
+			AutoButtonColor = false,
+			Visible = false,
+			Parent = row,
+		})
+		local entry = { btn = btn, hovered = false }
+		btn.MouseEnter:Connect(function()
+			if entry.player then
+				entry.hovered = true
+				lib:showAvatar(entry.player)
+			end
+		end)
+		btn.MouseLeave:Connect(function()
+			if entry.hovered then
+				entry.hovered = false
+				lib:hideAvatar()
+			end
+		end)
+		hits[i] = entry
+		return entry
+	end
+
+	local function applyTargets(map)
+		map = map or {}
+		local changed = false
+		local maxIndex = #hits
+		for k in pairs(map) do
+			if type(k) == "number" and k > maxIndex then
+				maxIndex = k
+			end
+		end
+		for i = 1, maxIndex do
+			local entry = getHit(i)
+			if entry.player ~= map[i] then
+				entry.player = map[i]
+				changed = true
+			end
+		end
+		return changed
+	end
+
+	local function layoutHits()
+		local lines = string.split(text.Text, "\n")
+		local lineH = text.TextBounds.Y / math.max(#lines, 1)
+		if lineH <= 0 then
+			lineH = textSize
+		end
+		layoutToken += 1
+		local tok = layoutToken
+
+		for i, entry in ipairs(hits) do
+			local show = entry.player ~= nil and lines[i] ~= nil
+			if not show and entry.hovered then
+				entry.hovered = false
+				lib:hideAvatar()
+			end
+			entry.btn.Visible = show
+			if show then
+				entry.btn.Position = UDim2.fromOffset(0, (i - 1) * lineH)
+				entry.btn.Size = UDim2.new(1, 0, 0, lineH)
+				task.spawn(function()
+					local ok, bounds = pcall(function()
+						local params = Instance.new("GetTextBoundsParams")
+						params.Text = lines[i]
+						params.Font = text.FontFace
+						params.Size = text.TextSize
+						params.Width = math.max(text.AbsoluteSize.X, 1)
+						params.RichText = true
+						return TextService:GetTextBoundsAsync(params)
+					end)
+					if ok and tok == layoutToken then
+						entry.btn.Size = UDim2.fromOffset(math.ceil(bounds.X) + 6, lineH)
+					end
+				end)
+			end
+		end
+	end
+
+	text:GetPropertyChangedSignal("TextBounds"):Connect(layoutHits)
+
 	local function evaluate()
-		local ok, result = pcall(updater)
+		local ok, result, map = pcall(updater)
 		if ok then
 			local s = tostring(result)
-			if text.Text ~= s then
+			local textChanged = text.Text ~= s
+			if textChanged then
 				text.Text = s
+			end
+			if applyTargets(map) and not textChanged then
+				layoutHits()
 			end
 		end
 	end
@@ -2270,6 +2369,9 @@ function Section:addLabel(content, interval)
 		else
 			updater = nil
 			text.Text = tostring(value)
+			if applyTargets(nil) then
+				layoutHits()
+			end
 		end
 	end
 	function obj:Get()
