@@ -22,9 +22,20 @@
 	(dropdown also has :Refresh(list), button has :SetTitle only).
 
 	Section:addPlayers(title, callback, includeSelf?)           callback(Player or nil, obj)  -- hover = avatar preview
-	Section:addLabel(textOrFunction, interval?, textSize?)      -- function = updates in real time
-	                                                            -- function may return (text, { [line] = Player }) -> hover line = avatar
+	Section:addLabel(textOrFunction, tip?, interval?)           -- function = updates in real time
 	Section:addWheel(title, options, callback)                  callback(result, index, obj)
+
+	TIPS  (hover tooltips)
+	local addTip = Library.addTip          -- (also available as UI.addTip)
+	addTip[1]("text", "title?")            -- regular tooltip that follows the cursor
+	addTip[2](playerOrName?)               -- avatar card on the right of the GUI (no argument = detect the player from the element's text)
+	addTip[3](imageAssetId, "message", "title?")   -- image + message card on the right of the GUI
+	Any element:  element:addTip(addTip[1]("hi"))   or   element:addTip(1, "hi")   |   element:removeTip()
+	Trailing argument:  addButton(title, cb, tip) · addToggle(title, default, cb, tip) · addDropdown(title, list, cb, tip) · addLabel(text, tip)
+	Dropdown (tip shows while hovering its items):
+	    dropdown:addTip(addTip[1]("for every item"))
+	    dropdown:addTip("Sakura", addTip[3](123456, "only for this item"))
+	    dropdown:addTip({ Fuji = addTip[1]("..."), Ramen = addTip[3](123456, "...") })
 
 	UI:setSize(w, h) / UI:resetSize()                           -- window is also resizable by dragging its edges
 	UI:toggle(force?)          show / hide the window
@@ -55,12 +66,12 @@ end
 
 local DEFAULT_THEME = {
 	Accent = hex("FFEAF7"),
-	Background = Color3.fromRGB(13, 15, 17),
-	Panel = Color3.fromRGB(20, 24, 26),
-	Element = Color3.fromRGB(28, 33, 36),
-	Stroke = Color3.fromRGB(52, 64, 60),
-	Text = Color3.fromRGB(236, 246, 241),
-	SubText = Color3.fromRGB(143, 160, 152),
+	Background = Color3.fromRGB(14, 13, 16),
+	Panel = Color3.fromRGB(22, 20, 24),
+	Element = Color3.fromRGB(30, 28, 33),
+	Stroke = Color3.fromRGB(62, 54, 62),
+	Text = Color3.fromRGB(248, 240, 246),
+	SubText = Color3.fromRGB(160, 148, 157),
 }
 
 local DEFAULT_ICONS = { "桜", "月", "星", "雪", "風", "火", "水", "花" }
@@ -212,6 +223,7 @@ function Library.new(title, subtitle)
 	self.toggleKey = Enum.KeyCode.RightControl
 	self.petalsEnabled = true
 	self.thumbs = {}
+	self.tipTargets, self.tipOccluders, self.userCache = {}, {}, {}
 
 	local parent = getGuiParent()
 	local guiName = "SakuraUI_" .. title
@@ -567,6 +579,11 @@ function Library.new(title, subtitle)
 	self.defaultSize = root.Size
 	self:_makeResizer()
 
+	-- hover tips (see addTip)
+	self:_connect(RunService.Heartbeat, function()
+		self:_tipStep()
+	end)
+
 	-- entrance animation
 	tw(self.scale, { Scale = 1 }, 0.45, Enum.EasingStyle.Back)
 	tw(window, { GroupTransparency = 0 }, 0.35)
@@ -828,6 +845,8 @@ function Library:showAvatar(plr)
 		return
 	end
 
+	self:hideInfo() -- the info card and the avatar card share the same slot
+
 	local a = self:_getAvatarPanel()
 	self._avatarToken = (self._avatarToken or 0) + 1
 	local tok = self._avatarToken
@@ -875,6 +894,611 @@ function Library:hideAvatar()
 			a.panel.Visible = false
 		end
 	end)
+end
+
+--------------------------------------------------------------------------
+-- tips  (addTip[1] cursor tooltip · addTip[2] avatar card · addTip[3] image card)
+--------------------------------------------------------------------------
+
+local TipMT = {}
+TipMT.__call = function(self, ...)
+	return setmetatable({ _isTip = true, mode = self.mode, args = table.pack(...) }, TipMT)
+end
+TipMT.__tostring = function(self)
+	return "addTip[" .. tostring(self.mode) .. "]"
+end
+
+local function newTip(mode, ...)
+	return setmetatable({ _isTip = true, mode = mode, args = table.pack(...) }, TipMT)
+end
+
+local function isTip(v)
+	return type(v) == "table" and rawget(v, "_isTip") == true
+end
+
+-- accepts: a tip descriptor, a mode number + its arguments, or a plain string (= tooltip text)
+local function toTip(a, ...)
+	if isTip(a) then
+		if select("#", ...) > 0 then
+			return newTip(a.mode, ...)
+		end
+		return a
+	elseif type(a) == "number" and a >= 1 and a <= 3 and math.floor(a) == a then
+		return newTip(a, ...)
+	elseif type(a) == "string" then
+		return newTip(1, a, ...)
+	end
+	return nil
+end
+
+local function resolveArg(v, ctx)
+	if type(v) == "function" then
+		local ok, result = pcall(v, ctx)
+		if ok then
+			return result
+		end
+		return nil
+	end
+	return v
+end
+
+local function toImage(id)
+	if id == nil or id == "" then
+		return nil
+	end
+	if type(id) == "number" then
+		return "rbxassetid://" .. tostring(id)
+	end
+	id = tostring(id)
+	if id:match("^%d+$") then
+		return "rbxassetid://" .. id
+	end
+	return id
+end
+
+local function mousePos()
+	return UserInputService:GetMouseLocation() - GuiService:GetGuiInset()
+end
+
+local function pointIn(gui, p)
+	local a, s = gui.AbsolutePosition, gui.AbsoluteSize
+	return p.X >= a.X and p.X <= a.X + s.X and p.Y >= a.Y and p.Y <= a.Y + s.Y
+end
+
+-- is `gui` visible and not clipped away at point p?
+local function shownAt(gui, p)
+	local cur = gui
+	while cur and not cur:IsA("LayerCollector") do
+		if cur:IsA("GuiObject") then
+			if not cur.Visible then
+				return false
+			end
+			if cur ~= gui and (cur.ClipsDescendants or cur:IsA("ScrollingFrame") or cur:IsA("CanvasGroup")) then
+				if not pointIn(cur, p) then
+					return false
+				end
+			end
+		end
+		cur = cur.Parent
+	end
+	return cur ~= nil
+end
+
+Library.addTip = { newTip(1), newTip(2), newTip(3) }
+
+-- elements register a hover area; popups (dropdown lists, pickers…) register as occluders
+function Library:_registerTip(gui, tip, getText)
+	local entry = { gui = gui, tip = tip, getText = getText }
+	table.insert(self.tipTargets, entry)
+	return entry
+end
+
+function Library:_unregisterTip(entry)
+	local i = table.find(self.tipTargets, entry)
+	if i then
+		table.remove(self.tipTargets, i)
+	end
+	self:_tipClear(entry)
+end
+
+function Library:_addOccluder(frame)
+	table.insert(self.tipOccluders, frame)
+end
+
+-- player lookup helpers (mode 2) ------------------------------------------
+
+function Library:_findPlayer(query)
+	if typeof(query) == "Instance" then
+		return query:IsA("Player") and query or nil
+	end
+	if type(query) == "number" then
+		return Players:GetPlayerByUserId(query)
+	end
+	if type(query) ~= "string" then
+		return nil
+	end
+	local q = query:lower()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower() == q or p.DisplayName:lower() == q then
+			return p
+		end
+	end
+	return nil
+end
+
+-- returns a Player (in this server), a username string / userId number (needs a lookup), or nil
+function Library:_playerTarget(arg, ctx)
+	arg = resolveArg(arg, ctx)
+
+	if arg == nil then
+		if type(ctx) ~= "string" then
+			return nil
+		end
+		local text = (ctx:gsub("<[^>]+>", ""))
+		local lower = text:lower()
+
+		-- 1) a player in this server whose name appears in the text (longest match wins)
+		local best, bestLen
+		for _, p in ipairs(Players:GetPlayers()) do
+			for _, n in ipairs({ p.Name, p.DisplayName }) do
+				if #n >= 3 and lower:find(n:lower(), 1, true) and (not bestLen or #n > bestLen) then
+					best, bestLen = p, #n
+				end
+			end
+		end
+		if best then
+			return best
+		end
+
+		-- 2) otherwise treat whatever follows the last ":" as a username
+		local candidate = text:match("([^:]*)$") or text
+		candidate = candidate:gsub("^%s+", ""):gsub("%s+$", "")
+		if #candidate >= 3 and #candidate <= 20 and candidate:match("^[%w_]+$") then
+			return candidate
+		end
+		return nil
+	end
+
+	local p = self:_findPlayer(arg)
+	if p then
+		return p
+	end
+	if type(arg) == "string" or type(arg) == "number" then
+		return arg
+	end
+	return nil
+end
+
+-- turns a target into something showAvatar can use (may yield)
+function Library:_userFrom(target)
+	if typeof(target) == "Instance" then
+		return target
+	end
+
+	local key = tostring(target):lower()
+	local cached = self.userCache[key]
+	if cached ~= nil then
+		return cached or nil
+	end
+
+	local ok, id, name
+	if type(target) == "number" then
+		id = target
+		ok, name = pcall(function()
+			return Players:GetNameFromUserIdAsync(target)
+		end)
+		if not ok then
+			name = tostring(target)
+		end
+	else
+		ok, id = pcall(function()
+			return Players:GetUserIdFromNameAsync(target)
+		end)
+		name = target
+		if not ok then
+			id = nil
+		end
+	end
+
+	if id then
+		local user = { Name = name, DisplayName = name, UserId = id }
+		self.userCache[key] = user
+		return user
+	end
+	self.userCache[key] = false
+	return nil
+end
+
+-- cursor tooltip (mode 1) --------------------------------------------------
+
+function Library:_getTooltip()
+	if self.tooltip then
+		return self.tooltip
+	end
+
+	local frame = self:_new("Frame", {
+		Name = "Tooltip",
+		AutomaticSize = Enum.AutomaticSize.XY,
+		Size = UDim2.fromOffset(0, 0),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 1000,
+		_theme = { BackgroundColor3 = "Panel" },
+		Parent = self.gui,
+	}, {
+		self:_corner(8),
+		self:_new("UIPadding", {
+			PaddingTop = UDim.new(0, 7),
+			PaddingBottom = UDim.new(0, 7),
+			PaddingLeft = UDim.new(0, 10),
+			PaddingRight = UDim.new(0, 10),
+		}),
+		self:_new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }),
+	})
+
+	local stroke = self:_new("UIStroke", {
+		Thickness = 1.5,
+		Transparency = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		_theme = { Color = "Accent" },
+		Parent = frame,
+	})
+
+	local function makeLabel(name, order, size, font, color)
+		return self:_new("TextLabel", {
+			Name = name,
+			LayoutOrder = order,
+			Size = UDim2.fromOffset(0, 0),
+			AutomaticSize = Enum.AutomaticSize.XY,
+			BackgroundTransparency = 1,
+			Text = "",
+			TextSize = size,
+			TextWrapped = true,
+			RichText = true,
+			TextTransparency = 1,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			ZIndex = 1001,
+			_font = font,
+			_theme = { TextColor3 = color },
+			Parent = frame,
+		}, {
+			self:_new("UISizeConstraint", { MaxSize = Vector2.new(240, 10000) }),
+		})
+	end
+
+	self.tooltip = {
+		frame = frame,
+		stroke = stroke,
+		title = makeLabel("Title", 1, 13, "Title", "Accent"),
+		body = makeLabel("Body", 2, 13, "Body", "Text"),
+	}
+	return self.tooltip
+end
+
+function Library:_tipPlace(pos)
+	local t = self.tooltip
+	if not t or not t.frame.Visible then
+		return
+	end
+	local size = t.frame.AbsoluteSize
+	local screen = self.gui.AbsoluteSize
+	local x, y = pos.X + 16, pos.Y + 20
+	if x + size.X + 8 > screen.X then
+		x = pos.X - size.X - 12
+	end
+	if y + size.Y + 8 > screen.Y then
+		y = pos.Y - size.Y - 12
+	end
+	t.frame.Position = UDim2.fromOffset(math.max(x, 4), math.max(y, 4))
+end
+
+function Library:_showTooltip(text, title)
+	local t = self:_getTooltip()
+	self._ttTok = (self._ttTok or 0) + 1
+
+	local hasTitle = title ~= nil and tostring(title) ~= ""
+	t.title.Text = hasTitle and tostring(title) or ""
+	t.title.Visible = hasTitle
+	t.body.Text = text
+
+	t.frame.Visible = true
+	self:_tipPlace(mousePos())
+
+	tw(t.frame, { BackgroundTransparency = 0.02 }, 0.12)
+	tw(t.stroke, { Transparency = 0.35 }, 0.12)
+	tw(t.title, { TextTransparency = 0 }, 0.12)
+	tw(t.body, { TextTransparency = 0 }, 0.12)
+end
+
+function Library:_hideTooltip()
+	local t = self.tooltip
+	if not t then
+		return
+	end
+	self._ttTok = (self._ttTok or 0) + 1
+	local tok = self._ttTok
+
+	tw(t.frame, { BackgroundTransparency = 1 }, 0.1)
+	tw(t.stroke, { Transparency = 1 }, 0.1)
+	tw(t.title, { TextTransparency = 1 }, 0.1)
+	tw(t.body, { TextTransparency = 1 }, 0.1)
+	task.delay(0.12, function()
+		if self._ttTok == tok then
+			t.frame.Visible = false
+		end
+	end)
+end
+
+-- image + message card (mode 3), shown on the right of the GUI ---------------
+
+function Library:_getInfoPanel()
+	if self.info then
+		return self.info
+	end
+
+	local panel = self:_new("CanvasGroup", {
+		Name = "InfoPanel",
+		Position = UDim2.new(1, 26, 0, 0),
+		Size = UDim2.fromOffset(180, 226),
+		GroupTransparency = 1,
+		Visible = false,
+		_theme = { BackgroundColor3 = "Panel" },
+		Parent = self.root,
+	}, { self:_corner(12) })
+
+	self:_new("TextLabel", {
+		Name = "Heading",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(0, 9),
+		Size = UDim2.new(1, 0, 0, 14),
+		Text = "情報  ·  INFO",
+		TextSize = 10,
+		Font = Enum.Font.Gotham,
+		_theme = { TextColor3 = "SubText" },
+		Parent = panel,
+	})
+
+	local image = self:_new("ImageLabel", {
+		Name = "Image",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 30),
+		Size = UDim2.fromOffset(140, 140),
+		BorderSizePixel = 0,
+		ScaleType = Enum.ScaleType.Fit,
+		_theme = { BackgroundColor3 = "Element" },
+		Parent = panel,
+	}, { self:_corner(12) })
+
+	local title = self:_new("TextLabel", {
+		Name = "Title",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(8, 176),
+		Size = UDim2.new(1, -16, 0, 20),
+		TextSize = 15,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		_font = "Title",
+		_theme = { TextColor3 = "Accent" },
+		Parent = panel,
+	})
+
+	local body = self:_new("TextLabel", {
+		Name = "Message",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(8, 176),
+		Size = UDim2.new(1, -16, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Text = "",
+		TextSize = 13,
+		TextWrapped = true,
+		RichText = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		_font = "Body",
+		_theme = { TextColor3 = "Text" },
+		Parent = panel,
+	})
+
+	self:_new("Frame", {
+		Name = "Outline",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Parent = panel,
+	}, {
+		self:_corner(12),
+		self:_new("UIStroke", {
+			Thickness = 2,
+			Transparency = 0.5,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+			_theme = { Color = "Accent" },
+		}),
+	})
+
+	local info = { panel = panel, image = image, title = title, body = body, hasImage = true, hasTitle = false }
+
+	-- stack image / title / message and grow the card to fit the message
+	function info.relayout()
+		local y = info.hasImage and 176 or 32
+		title.Visible = info.hasTitle
+		title.Position = UDim2.fromOffset(8, y)
+		if info.hasTitle then
+			y += 24
+		end
+		body.Position = UDim2.fromOffset(8, y)
+		panel.Size = UDim2.fromOffset(180, y + body.AbsoluteSize.Y + 14)
+	end
+	body:GetPropertyChangedSignal("AbsoluteSize"):Connect(info.relayout)
+
+	self.info = info
+	return info
+end
+
+function Library:showInfo(image, text, title)
+	self:hideAvatar() -- shares the slot with the avatar card
+
+	local p = self:_getInfoPanel()
+	self._infoToken = (self._infoToken or 0) + 1
+
+	local img = toImage(image)
+	p.hasImage = img ~= nil
+	p.image.Visible = p.hasImage
+	p.image.Image = img or ""
+
+	p.hasTitle = title ~= nil and tostring(title) ~= ""
+	p.title.Text = p.hasTitle and tostring(title) or ""
+	p.body.Text = text ~= nil and tostring(text) or ""
+	p.relayout()
+
+	if not p.panel.Visible then
+		p.panel.Position = UDim2.new(1, 26, 0, 0)
+	end
+	p.panel.Visible = true
+	tw(p.panel, { Position = UDim2.new(1, 14, 0, 0), GroupTransparency = 0 }, 0.25)
+end
+
+function Library:hideInfo()
+	local p = self.info
+	if not p or not p.panel.Visible then
+		return
+	end
+	self._infoToken = (self._infoToken or 0) + 1
+	local tok = self._infoToken
+	tw(p.panel, { Position = UDim2.new(1, 26, 0, 0), GroupTransparency = 1 }, 0.2)
+	task.delay(0.22, function()
+		if self._infoToken == tok then
+			p.panel.Visible = false
+		end
+	end)
+end
+
+-- tip engine -------------------------------------------------------------------
+
+function Library:_tipDeactivate()
+	local cur = self._tip
+	self._tip = nil
+	self._tipToken = (self._tipToken or 0) + 1 -- cancels pending lookups
+	if not cur then
+		return
+	end
+	if cur.mode == 1 then
+		self:_hideTooltip()
+	elseif cur.mode == 2 then
+		self:hideAvatar()
+	elseif cur.mode == 3 then
+		self:hideInfo()
+	end
+end
+
+function Library:_tipClear(owner)
+	local cur = self._tip
+	if cur and (owner == nil or cur.owner == owner) then
+		self:_tipDeactivate()
+	end
+end
+
+-- owner: whatever is hovered (an element entry, a dropdown's list…)
+-- ctx:   the hovered element's text (used for auto-detecting players / passed to function arguments)
+function Library:_tipSet(owner, tip, ctx, polled)
+	local mode, args = tip.mode, tip.args
+
+	-- work out what would be shown, and a signature so unchanged content isn't re-triggered
+	local sig, target, a1, a2, a3
+	if mode == 1 then
+		a1, a2 = resolveArg(args[1], ctx), resolveArg(args[2], ctx)
+		if a1 ~= nil then
+			sig = "1|" .. tostring(a1) .. "|" .. tostring(a2)
+		end
+	elseif mode == 2 then
+		target = self:_playerTarget(args[1], ctx)
+		if target ~= nil then
+			if typeof(target) == "Instance" then
+				sig = "2|p" .. tostring(target.UserId)
+			else
+				sig = "2|n" .. tostring(target):lower()
+			end
+		end
+	elseif mode == 3 then
+		a1, a2, a3 = resolveArg(args[1], ctx), resolveArg(args[2], ctx), resolveArg(args[3], ctx)
+		sig = "3|" .. tostring(a1) .. "|" .. tostring(a2) .. "|" .. tostring(a3)
+	end
+
+	local cur = self._tip
+	if cur and cur.owner == owner and cur.sig == sig then
+		return
+	end
+	if cur then
+		self:_tipDeactivate()
+	end
+	if not sig then
+		return
+	end
+
+	self._tipToken = (self._tipToken or 0) + 1
+	local tok = self._tipToken
+	self._tip = { owner = owner, sig = sig, polled = polled, mode = mode }
+
+	if mode == 1 then
+		self:_showTooltip(tostring(a1), a2)
+	elseif mode == 2 then
+		task.spawn(function()
+			local user = self:_userFrom(target)
+			if user and self._tipToken == tok then
+				self:showAvatar(user)
+			end
+		end)
+	else
+		self:showInfo(a1, a2, a3)
+	end
+end
+
+-- runs every frame: finds the hovered element and shows / hides its tip
+function Library:_tipStep()
+	if not self.visible then
+		if self._tip then
+			self:_tipDeactivate()
+		end
+		return
+	end
+
+	local pos = mousePos()
+	if self._tip and self._tip.mode == 1 then
+		self:_tipPlace(pos)
+	end
+
+	if #self.tipTargets == 0 or not UserInputService.MouseEnabled then
+		return
+	end
+
+	local hovered
+	if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+		local blocked = false
+		for i = #self.tipOccluders, 1, -1 do
+			local occ = self.tipOccluders[i]
+			if not occ.Parent then
+				table.remove(self.tipOccluders, i)
+			elseif not blocked and pointIn(occ, pos) and shownAt(occ, pos) then
+				blocked = true
+			end
+		end
+
+		if not blocked then
+			for i = #self.tipTargets, 1, -1 do
+				local e = self.tipTargets[i]
+				if not e.gui.Parent then
+					table.remove(self.tipTargets, i)
+				elseif not hovered and pointIn(e.gui, pos) and shownAt(e.gui, pos) then
+					hovered = e
+				end
+			end
+		end
+	end
+
+	if hovered then
+		self:_tipSet(hovered, hovered.tip, hovered.getText and hovered.getText() or nil, true)
+	elseif self._tip and self._tip.polled then
+		self:_tipDeactivate()
+	end
 end
 
 function Library:Destroy()
@@ -1019,7 +1643,11 @@ function Library:Notify(title, text, duration, callback)
 	tw(toast, { Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0 }, 0.4, Enum.EasingStyle.Back)
 	tw(progress, { Size = UDim2.new(0, 0, 0, 2) }, duration, Enum.EasingStyle.Linear)
 	task.delay(duration, function()
-		close(callback and false or nil)
+		if callback then
+			close(false) -- timed out = declined
+		else
+			close()
+		end
 	end)
 end
 
@@ -1630,8 +2258,12 @@ end
 -- dropdown
 --------------------------------------------------------------------------
 
-function Section:addDropdown(title, list, callback)
-	return self:_dropdown(title, list, callback)
+function Section:addDropdown(title, list, callback, tip)
+	local dropdown = self:_dropdown(title, list, callback)
+	if tip ~= nil then
+		dropdown:addTip(tip)
+	end
+	return dropdown
 end
 
 function Section:_dropdown(title, list, callback, opts)
@@ -1640,6 +2272,7 @@ function Section:_dropdown(title, list, callback, opts)
 	local items = list or {}
 	local selected, open, focused = nil, false, false
 	local ITEM_H, GAP = 26, 3
+	local defaultTip, tipMap, hoverBtn = nil, {}, nil -- addTip state (tips show while hovering items)
 
 	local holder = lib:_new("Frame", {
 		Name = "Dropdown",
@@ -1698,6 +2331,8 @@ function Section:_dropdown(title, list, callback, opts)
 		lib:_new("UIStroke", { Thickness = 1, Transparency = 0.6, _theme = { Color = "Stroke" } }),
 	})
 
+	lib:_addOccluder(listFrame) -- element tips underneath the open list must not trigger
+
 	local scroll = lib:_new("ScrollingFrame", {
 		Name = "Scroll",
 		Position = UDim2.fromOffset(4, 4),
@@ -1744,6 +2379,8 @@ function Section:_dropdown(title, list, callback, opts)
 	end
 
 	populate = function(filterText)
+		hoverBtn = nil
+		lib:_tipClear(scroll)
 		for _, child in ipairs(scroll:GetChildren()) do
 			if child:IsA("TextButton") or child:IsA("TextLabel") then
 				child:Destroy()
@@ -1778,11 +2415,20 @@ function Section:_dropdown(title, list, callback, opts)
 					if opts.onHover then
 						opts.onHover(item)
 					end
+					hoverBtn = btn
+					local tip = tipMap[item] or defaultTip
+					if tip then
+						lib:_tipSet(scroll, tip, text)
+					end
 				end)
 				btn.MouseLeave:Connect(function()
 					tw(btn, { BackgroundColor3 = item == selected and lib.theme.Stroke or lib.theme.Element }, 0.1)
 					if opts.onLeave then
 						opts.onLeave()
+					end
+					if hoverBtn == btn then
+						hoverBtn = nil
+						lib:_tipClear(scroll)
 					end
 				end)
 				btn.MouseButton1Click:Connect(function()
@@ -1814,6 +2460,8 @@ function Section:_dropdown(title, list, callback, opts)
 			populate("")
 		else
 			tw(holder, { Size = UDim2.new(1, 0, 0, 32) }, 0.25)
+			hoverBtn = nil
+			lib:_tipClear(scroll)
 			if opts.onLeave then
 				opts.onLeave()
 			end
@@ -1839,6 +2487,40 @@ function Section:_dropdown(title, list, callback, opts)
 			populate(search.Text)
 		end
 	end)
+
+	-- tips shown while hovering the items of the open list:
+	--   dropdown:addTip(addTip[1]("every item"))                      -- all items
+	--   dropdown:addTip("Sakura", addTip[3](123456, "just this one"))   -- one item
+	--   dropdown:addTip({ Fuji = addTip[1]("..."), Ramen = ... })       -- several items
+	-- a function argument receives the hovered item, e.g. addTip[1](function(item) return "Pick " .. item end)
+	function obj:addTip(first, ...)
+		local second = ...
+		if isTip(second) then
+			tipMap[first] = second
+		elseif type(first) == "table" and not isTip(first) then
+			for item, t in pairs(first) do
+				local tip = toTip(t)
+				if tip then
+					tipMap[item] = tip
+				end
+			end
+		else
+			local tip = toTip(first, ...)
+			if tip then
+				defaultTip = tip
+			else
+				warn("[SakuraUI] addTip expects addTip[1], addTip[2] or addTip[3]")
+			end
+		end
+		return obj
+	end
+	function obj:removeTip()
+		defaultTip = nil
+		table.clear(tipMap)
+		hoverBtn = nil
+		lib:_tipClear(scroll)
+		return obj
+	end
 
 	function obj:Refresh(newList)
 		items = newList or {}
@@ -1986,6 +2668,8 @@ function Section:addColorPicker(title, default, callback)
 		lib:_corner(7),
 		lib:_new("UIStroke", { Thickness = 1, Transparency = 0.6, _theme = { Color = "Stroke" } }),
 	})
+
+	lib:_addOccluder(panel) -- tips of elements underneath the open picker must not trigger
 
 	-- saturation / value square
 	local sv = lib:_new("Frame", {
@@ -2158,7 +2842,7 @@ end
 
 -- dropdown listing the server's players; hovering a name previews the avatar
 -- callback(Player or nil, obj)
-function Section:addPlayers(title, callback, includeSelf)
+function Section:addPlayers(title, callback, includeSelf, tip)
 	local lib = self.page.library
 	if includeSelf == nil then
 		includeSelf = true
@@ -2213,17 +2897,27 @@ function Section:addPlayers(title, callback, includeSelf)
 		refresh(leaving)
 	end)
 
+	if tip ~= nil then
+		dropdown:addTip(tip)
+	end
+
 	return dropdown
 end
 
 -- text that can update in real time:
 --   addLabel("static text")
---   addLabel(function() return "FPS: " .. fps end, 0.1)   -- re-evaluated every `interval` seconds
+--   addLabel(function() return "FPS: " .. fps end)                 -- re-evaluated every 0.1s
+--   addLabel(function() ... end, 0.5)                              -- custom refresh interval
+--   addLabel("This player: Acerthecompu", addTip[2])               -- hover = that player's avatar
+--   addLabel(function() ... end, addTip[1]("tip"), 0.2)            -- tip + interval
 -- supports rich text, e.g. <b>bold</b>
-function Section:addLabel(content, interval, textSize)
+-- (the tip argument is applied by the element wrapper further down)
+function Section:addLabel(content, tip, interval)
 	local lib = self.page.library
+	if type(tip) == "number" then -- addLabel(content, interval)
+		interval = tip
+	end
 	interval = interval or 0.1
-	textSize = textSize or 13
 
 	local row = self:_row("Label", 32)
 	row.AutomaticSize = Enum.AutomaticSize.Y
@@ -2237,11 +2931,11 @@ function Section:addLabel(content, interval, textSize)
 
 	local text = lib:_new("TextLabel", {
 		Name = "Text",
-		Size = UDim2.new(1, 0, 0, textSize + 3),
+		Size = UDim2.new(1, 0, 0, 16),
 		AutomaticSize = Enum.AutomaticSize.Y,
 		BackgroundTransparency = 1,
 		Text = "",
-		TextSize = textSize,
+		TextSize = 13,
 		TextWrapped = true,
 		RichText = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
@@ -2255,109 +2949,12 @@ function Section:addLabel(content, interval, textSize)
 	local elapsed = 0
 	local obj = { Instance = row }
 
-	-- hover zones: the updater may return a second value, a table { [lineNumber] = Player },
-	-- and hovering that line's text shows the player's avatar (like addPlayers)
-	local TextService = game:GetService("TextService")
-	local hits = {}
-	local layoutToken = 0
-
-	local function getHit(i)
-		if hits[i] then
-			return hits[i]
-		end
-		local btn = lib:_new("TextButton", {
-			Name = "Hover" .. i,
-			BackgroundTransparency = 1,
-			Text = "",
-			AutoButtonColor = false,
-			Visible = false,
-			Parent = row,
-		})
-		local entry = { btn = btn, hovered = false }
-		btn.MouseEnter:Connect(function()
-			if entry.player then
-				entry.hovered = true
-				lib:showAvatar(entry.player)
-			end
-		end)
-		btn.MouseLeave:Connect(function()
-			if entry.hovered then
-				entry.hovered = false
-				lib:hideAvatar()
-			end
-		end)
-		hits[i] = entry
-		return entry
-	end
-
-	local function applyTargets(map)
-		map = map or {}
-		local changed = false
-		local maxIndex = #hits
-		for k in pairs(map) do
-			if type(k) == "number" and k > maxIndex then
-				maxIndex = k
-			end
-		end
-		for i = 1, maxIndex do
-			local entry = getHit(i)
-			if entry.player ~= map[i] then
-				entry.player = map[i]
-				changed = true
-			end
-		end
-		return changed
-	end
-
-	local function layoutHits()
-		local lines = string.split(text.Text, "\n")
-		local lineH = text.TextBounds.Y / math.max(#lines, 1)
-		if lineH <= 0 then
-			lineH = textSize
-		end
-		layoutToken += 1
-		local tok = layoutToken
-
-		for i, entry in ipairs(hits) do
-			local show = entry.player ~= nil and lines[i] ~= nil
-			if not show and entry.hovered then
-				entry.hovered = false
-				lib:hideAvatar()
-			end
-			entry.btn.Visible = show
-			if show then
-				entry.btn.Position = UDim2.fromOffset(0, (i - 1) * lineH)
-				entry.btn.Size = UDim2.new(1, 0, 0, lineH)
-				task.spawn(function()
-					local ok, bounds = pcall(function()
-						local params = Instance.new("GetTextBoundsParams")
-						params.Text = lines[i]
-						params.Font = text.FontFace
-						params.Size = text.TextSize
-						params.Width = math.max(text.AbsoluteSize.X, 1)
-						params.RichText = true
-						return TextService:GetTextBoundsAsync(params)
-					end)
-					if ok and tok == layoutToken then
-						entry.btn.Size = UDim2.fromOffset(math.ceil(bounds.X) + 6, lineH)
-					end
-				end)
-			end
-		end
-	end
-
-	text:GetPropertyChangedSignal("TextBounds"):Connect(layoutHits)
-
 	local function evaluate()
-		local ok, result, map = pcall(updater)
+		local ok, result = pcall(updater)
 		if ok then
 			local s = tostring(result)
-			local textChanged = text.Text ~= s
-			if textChanged then
+			if text.Text ~= s then
 				text.Text = s
-			end
-			if applyTargets(map) and not textChanged then
-				layoutHits()
 			end
 		end
 	end
@@ -2370,9 +2967,6 @@ function Section:addLabel(content, interval, textSize)
 		else
 			updater = nil
 			text.Text = tostring(value)
-			if applyTargets(nil) then
-				layoutHits()
-			end
 		end
 	end
 	function obj:Get()
@@ -2443,6 +3037,8 @@ function Section:addWheel(title, options, callback)
 		lib:_corner(7),
 		lib:_new("UIStroke", { Thickness = 1, Transparency = 0.6, _theme = { Color = "Stroke" } }),
 	})
+
+	lib:_addOccluder(panel) -- tips of elements underneath the open wheel must not trigger
 
 	local wheelGroup = lib:_new("CanvasGroup", {
 		Name = "WheelDisc",
@@ -2731,6 +3327,75 @@ function Section:addWheel(title, options, callback)
 end
 
 --------------------------------------------------------------------------
+-- element tips: every element gets :addTip() / :removeTip(), and accepts a trailing tip argument
+--------------------------------------------------------------------------
+
+function Section:_tipify(obj, gui, getText)
+	local lib = self.page.library
+	local entry
+
+	function obj:addTip(...)
+		local tip = toTip(...)
+		if not tip then
+			warn("[SakuraUI] addTip expects addTip[1], addTip[2] or addTip[3]")
+			return obj
+		end
+		if entry then
+			entry.tip = tip
+		else
+			entry = lib:_registerTip(gui, tip, getText)
+		end
+		return obj
+	end
+
+	function obj:removeTip()
+		if entry then
+			lib:_unregisterTip(entry)
+			entry = nil
+		end
+		return obj
+	end
+
+	return obj
+end
+
+-- element -> position of its optional trailing `tip` argument
+local TIP_ARG = {
+	addButton = 3,
+	addToggle = 4,
+	addSlider = 7,
+	addTextbox = 4,
+	addKeybind = 5,
+	addColorPicker = 4,
+	addWheel = 4,
+	addLabel = 2,
+}
+
+for name, index in pairs(TIP_ARG) do
+	local original = Section[name]
+	Section[name] = function(self, ...)
+		local tip = select(index, ...)
+		if name == "addLabel" and type(tip) == "number" then
+			tip = nil -- addLabel(content, interval)
+		end
+
+		local obj = original(self, ...)
+
+		-- expandable elements (picker, wheel) only react on their header row
+		local gui = obj.Instance:FindFirstChild("Header") or obj.Instance
+		local label = gui:FindFirstChild("Title") or gui:FindFirstChild("Text")
+		self:_tipify(obj, gui, function()
+			return label and label.Text or nil
+		end)
+
+		if tip ~= nil then
+			obj:addTip(tip)
+		end
+		return obj
+	end
+end
+
+--------------------------------------------------------------------------
 -- ready-made settings page
 --------------------------------------------------------------------------
 
@@ -2768,6 +3433,7 @@ function Library:addSettingsPage()
 	local pickers = {}
 
 	local presets = {
+		["Sakura Blush"] = "FFEAF7",
 		["Sakura Mint"] = "BDFFD7",
 		["Sakura Pink"] = "FFB7D5",
 		["Sky Blue"] = "A8D8FF",
@@ -2775,7 +3441,7 @@ function Library:addSettingsPage()
 		["Sunset"] = "FFC49B",
 		["Matcha"] = "B8E986",
 	}
-	local presetNames = { "Sakura Mint", "Sakura Pink", "Sky Blue", "Wisteria", "Sunset", "Matcha" }
+	local presetNames = { "Sakura Blush", "Sakura Mint", "Sakura Pink", "Sky Blue", "Wisteria", "Sunset", "Matcha" }
 
 	theme:addDropdown("Accent preset", presetNames, function(name)
 		local color = hex(presets[name])
