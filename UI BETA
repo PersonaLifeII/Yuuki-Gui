@@ -28,7 +28,8 @@
 	TIPS  (hover tooltips)
 	local addTip = Library.addTip          -- (also available as UI.addTip)
 	addTip[1]("text", "title?")            -- regular tooltip that follows the cursor
-	addTip[2](playerOrName?)               -- avatar card on the right of the GUI (no argument = detect the player from the element's text)
+	addTip[2](playerOrName?)               -- avatar card on the right of the GUI (no argument = detect the player from the element's text;
+	                                       -- a function that returns a Player/name/nil works too, e.g. addTip[2](findMurderer))
 	addTip[3](imageAssetId, "message", "title?")   -- image + message card on the right of the GUI
 	Any element:  element:addTip(addTip[1]("hi"))   or   element:addTip(1, "hi")   |   element:removeTip()
 	Trailing argument:  addButton(title, cb, tip) · addToggle(title, default, cb, tip) · addDropdown(title, list, cb, tip) · addLabel(text, tip)
@@ -1028,9 +1029,10 @@ end
 
 -- returns a Player (in this server), a username string / userId number (needs a lookup), or nil
 function Library:_playerTarget(arg, ctx)
+	local isFunction = type(arg) == "function" -- a function that returns nil means "nobody", not "guess from the text"
 	arg = resolveArg(arg, ctx)
 
-	if arg == nil then
+	if arg == nil and not isFunction then
 		if type(ctx) ~= "string" then
 			return nil
 		end
@@ -1056,6 +1058,10 @@ function Library:_playerTarget(arg, ctx)
 		if #candidate >= 3 and #candidate <= 20 and candidate:match("^[%w_]+$") then
 			return candidate
 		end
+		return nil
+	end
+
+	if arg == nil then
 		return nil
 	end
 
@@ -2062,15 +2068,15 @@ function Section:addSlider(title, default, min, max, callback, step)
 	step = step or 1
 	local value = math.clamp(default or min, min, max)
 
-	local row = self:_row("Slider", 48)
+	local row = self:_row("Slider", 42)
 	local label = self:_label(row, title, -80)
-	label.Position = UDim2.fromOffset(12, -9)
-	label.Size = UDim2.new(1, -80, 0, 32)
+	label.Position = UDim2.fromOffset(12, 7) -- same line as the value box, close to the bar
+	label.Size = UDim2.new(1, -80, 0, 16)
 
 	local box = lib:_new("TextBox", {
 		Name = "Value",
 		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -12, 0, 8),
+		Position = UDim2.new(1, -12, 0, 7),
 		Size = UDim2.fromOffset(56, 16),
 		BackgroundTransparency = 1,
 		Text = tostring(value),
@@ -2084,7 +2090,7 @@ function Section:addSlider(title, default, min, max, callback, step)
 
 	local bar = lib:_new("Frame", {
 		Name = "Bar",
-		Position = UDim2.new(0, 12, 0, 33),
+		Position = UDim2.new(0, 12, 0, 30),
 		Size = UDim2.new(1, -24, 0, 5),
 		BorderSizePixel = 0,
 		_theme = { BackgroundColor3 = "Background" },
@@ -2147,8 +2153,8 @@ function Section:addSlider(title, default, min, max, callback, step)
 	local dragging = false
 	local hit = lib:_new("TextButton", {
 		Name = "Hit",
-		Position = UDim2.fromOffset(0, 24),
-		Size = UDim2.new(1, 0, 1, -24),
+		Position = UDim2.fromOffset(0, 22),
+		Size = UDim2.new(1, 0, 1, -22),
 		BackgroundTransparency = 1,
 		Text = "",
 		Parent = row,
