@@ -7,7 +7,7 @@ Method 1 (Easy, double click once. If you already have ZXP Installer)
 2. Restart After Effects if it was open.
 
 Method 2 (No other app needs to be installed):
-1. Download com.yuuki.gui.zip from the Assets below.
+1. Download com.yuuki.gui.zip
 2. Unzip it and place the folder into your Adobe CEP directory:
 Windows: C:\Users\<YourUsername>\AppData\Roaming\Adobe\CEP\extensions\com.yuuki.gui\
 macOS: ~/Library/Application Support/Adobe/CEP/extensions/com.yuuki.gui/
